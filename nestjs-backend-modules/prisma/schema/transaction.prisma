@@ -1,0 +1,141 @@
+enum TransactionStatus {
+  CREATED
+  QUOTE_CONFIRMED
+  PAYMENT_RECEIVED
+  PROCESSING
+  SENT_TO_PARTNER
+  REFUNDED
+  EXPIRED
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum IdempotencyScope {
+  CLIENT_API
+  WEBHOOK_BANK
+  WEBHOOK_PARTNER
+  LEDGER
+  OUTBOX_PARTNER_DISPATCH
+  ADMIN_ACTION
+}
+
+enum OutboxStatus {
+  PENDING
+  IN_FLIGHT
+  DELIVERED
+  DEAD
+}
+
+enum OutboxEventType {
+  PARTNER_DISPATCH
+  BANK_REFUND
+  NOTIFICATION_PUSH
+  NOTIFICATION_EMAIL
+  RECONCILIATION_TRIGGER
+}
+
+model Transaction {
+  id                  String            @id @default(uuid()) @db.Uuid
+  trackingNumber      String            @unique @map("tracking_number")
+  userId              String            @map("user_id") @db.Uuid
+  beneficiaryId       String            @map("beneficiary_id") @db.Uuid
+  quoteId             String?           @unique(map: "transactions_quote_id_key") @map("quote_id") @db.Uuid
+  sendAmount          Decimal           @map("send_amount") @db.Decimal(22, 6)
+  receiveAmount       Decimal           @map("receive_amount") @db.Decimal(22, 6)
+  fxRate              Decimal           @map("fx_rate") @db.Decimal(18, 6)
+  remittanceFee       Decimal           @default(1) @map("remittance_fee") @db.Decimal(22, 6)
+  senderCurrency      String            @map("sender_currency")
+  senderCountry       String            @map("sender_country")
+  beneficiaryCurrency String            @map("beneficiary_currency")
+  beneficiaryCountry  String            @map("beneficiary_country")
+  status              TransactionStatus @default(CREATED)
+  attempts            Int               @default(0)
+  // Partner-submission retry counter, kept separate from `attempts` (which the
+  // dispatcher owns for the PAYMENT_RECEIVED phase) so the two phases have
+  // independent budgets.
+  submitAttempts      Int               @default(0) @map("submit_attempts")
+  // Lease marker for the partner submitter: a worker stamps this before the
+  // (non-transactional) partner HTTP call so a second worker cannot dispatch the
+  // same PROCESSING row concurrently. NULL = unclaimed; a value older than the
+  // lease window is reclaimable (crash recovery).
+  claimedAt           DateTime?         @map("claimed_at") @db.Timestamptz(3)
+  createdAt           DateTime          @default(dbgenerated("CURRENT_TIMESTAMP(3)")) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user                   User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  beneficiary            Beneficiary               @relation(fields: [beneficiaryId], references: [id])
+  quote                  Quote?                    @relation(fields: [quoteId], references: [id])
+  ledgerEntries          LedgerEntry[]
+  idempotencyRecords     QuoteConfirmIdempotency[]
+  statusLogs             TransactionStatusLog[]
+  prefundingTransactions PrefundingTransaction[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  // Beneficiary deletion guard: fast lookup of blocking transactions by
+  // (beneficiary, status) when soft-deleting a beneficiary.
+  @@index([beneficiaryId, status])
+  // Partner-submitter candidate scan: PROCESSING rows ordered by claim state.
+  @@index([status, claimedAt])
+  @@map("transactions")
+}
+
+model TransactionStatusLog {
+  id            String             @id @default(uuid()) @db.Uuid
+  transactionId String             @map("transaction_id") @db.Uuid
+  fromStatus    TransactionStatus? @map("from_status")
+  toStatus      TransactionStatus  @map("to_status")
+  actor         String
+  reason        String?
+  metadata      Json?              @default("{}")
+  occurredAt    DateTime           @default(dbgenerated("CURRENT_TIMESTAMP(3)")) @map("occurred_at") @db.Timestamptz(3)
+
+  // Audit-grade retention: never cascade-delete with the parent transaction.
+  // Status logs are part of regulatory record-keeping and must survive even if
+  // the transactions table is restructured. Use NoAction so dropping a
+  // transaction first requires explicit handling of its status history.
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([transactionId, occurredAt(sort: Desc)])
+  @@index([toStatus, occurredAt(sort: Desc)])
+  @@map("transaction_status_logs")
+}
+
+model IdempotencyRecord {
+  id             String           @id @default(uuid()) @db.Uuid
+  scope          IdempotencyScope
+  key            String
+  requestHash    String?          @map("request_hash")
+  responseStatus Int?             @map("response_status")
+  responseBody   Json?            @map("response_body")
+  resultRefId    String?          @map("result_ref_id")
+  createdAt      DateTime         @default(dbgenerated("CURRENT_TIMESTAMP(3)")) @map("created_at") @db.Timestamptz(3)
+  expiresAt      DateTime         @map("expires_at") @db.Timestamptz(3)
+
+  @@unique([scope, key])
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
+
+model OutboxEvent {
+  id             String          @id @default(uuid()) @db.Uuid
+  aggregateType  String          @map("aggregate_type")
+  aggregateId    String          @map("aggregate_id")
+  eventType      OutboxEventType @map("event_type")
+  payload        Json
+  idempotencyKey String          @unique @map("idempotency_key")
+  status         OutboxStatus    @default(PENDING)
+  attempts       Int             @default(0)
+  maxAttempts    Int             @map("max_attempts")
+  nextRunAt      DateTime        @default(dbgenerated("CURRENT_TIMESTAMP(3)")) @map("next_run_at") @db.Timestamptz(3)
+  lastError      Json?           @map("last_error")
+  deadReason     String?         @map("dead_reason")
+  deliveredAt    DateTime?       @map("delivered_at") @db.Timestamptz(3)
+  createdAt      DateTime        @default(dbgenerated("CURRENT_TIMESTAMP(3)")) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([status, nextRunAt])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_events")
+}
